@@ -1,76 +1,87 @@
 #!/usr/bin/env python
 
+import configparser
+import argparse
 import requests
 import logging
-import smtplib
-import celery
 import redis
+import time
+import zmq
+import sys
 
-import salt.client
-
+# Import logging before Salt otherwise Salt will overwirte our settings
+logging.basicConfig(level=logging.INFO,
+                    format='[ %(asctime)-15s ] %(message)s')
 log = logging.getLogger(__name__)
 
+import salt.client
+from multiprocessing import Process
 
-class Meditation(object):
-    def __init__(self,
-                 hostname,
-                 username,
-                 password,
-                 redis,
-                 redis_port=6379,
-                 location=None):
 
-        self.hostname = hostname
-        self.username = username
-        self.password = password
+def server(hostname, username, password, interval=20):
+    '''
+    Query Sensu API for current monitoring events
+    '''
+    context = zmq.Context()
 
-        self.redis = redis
-        self.redis_port = redis_port
+    server = context.socket(zmq.PUSH)
+    server.bind("tcp://127.0.0.1:5557")
 
-        self.location = location
-
-    def __get_events(self):
-        '''
-        Grab Sensu Events
-        '''
-        req = requests.get(self.hostname + '/events',
-                           auth=(self.username, self.password))
+    while True:
+        req = requests.get(hostname + '/events', auth=(username, password))
 
         if req.status_code != 200:
-            log.error('Sensu API responded with status {0}'.format(
-                req.status_code)
-                )
-            return False
+            log.info('Sensu API responded with status {0}'.format(req.status_code))
 
-        return req.json()
+        for event in req.json():
+            server.send_json(event)
 
-    def proc(self):
-        '''
-        Parse the current Sensu events and have Salt run remediation actions
-        against problematic hosts
+        time.sleep(interval)
 
-        TODO: Validate remedy location
-              Read from configuration to set email address etc
-        '''
-        _jobs = redis.StrictRedis(host=self.redis, port=self.redis_port)
-        client = salt.client.LocalClient()
+    return True
 
-        status = {'success': {}, 'fail': {}}
 
-        for event in self.__get_events():
-            eventId = '|-'.join([event['client']['name'],
-                                 event['check']['name']])
+def worker(hostname, port=6379, location=None):
+    '''
+    Pull events from the ZeroMQ server and run remediation against
+    problematic events
+    '''
+    _jobs = redis.StrictRedis(host=hostname, port=port)
 
-            # Dont even run the check if we have already run remediation
+    context = zmq.Context()
+    client = salt.client.LocalClient()
+
+    status = {'success': {}, 'fail': {}}
+
+    worker = context.socket(zmq.PULL)
+    worker.connect("tcp://127.0.0.1:5557")
+
+    poller = zmq.Poller()
+    poller.register(worker, zmq.POLLIN)
+
+    while True:
+        socks = dict(poller.poll())
+
+        if socks.get(worker) == zmq.POLLIN:
+            event = worker.recv_json()
+            log.info('Got Event')
+
+            eventId = '|-'.join([event['client']['name'], event['check']['name']])
+
             if not _jobs.get(eventId):
-                if self.location:
-                    state = '/'.join([self.location, event['check']['name']])
+                if location:
+                    state = '/'.join([location, event['check']['name']])
                 else:
                     state = event['check']['name']
+
+                # Ensure the Salt command is not executed more than once
+                _jobs.set(eventId, True)
+                log.info('Locking event into Redis & Executing Salt Remedy')
 
                 res = client.cmd(event['client']['name'], 'state.sls', [state])
 
                 if isinstance(res[event['client']['name']], dict):
+                    log.info('{0} remedy was executed'.format(state))
                     for i in res[event['client']['name']].items():
                         action = i[-1]
 
@@ -81,21 +92,36 @@ class Meditation(object):
                             status['fail'].update({action['name']:
                                                    action['comment']})
 
-                    # Acknowledge that we tried to fix the issue. We should not
-                    # attempt to run the state again until sensu has rechecked
-                    # the service again
-                    _jobs.set(eventId, True)
-                    _jobs.expire(eventId, (event['check']['interval'] * 2))
-
-                    msg = 'Subject: Meditation {0} was executed\n \
-                           The following states were successfully run: X\n\n \
-                           The following states failed to run: X\n\n'.format(event['check']['name'])
-
-                    mail = smtplib.SMTP('localhost')
-                    mail.sendmail('damian@mirulabs.com', 'Damian.Myerscough@gmail.com', msg)
+                # We can remove our lock when Sensu has performed a check
+                _jobs.expire(eventId, (event['check']['interval'] * 2))
 
 
 if __name__ == '__main__':
 
-    sensu = Meditation('http://localhost:4567', 'admin', 'mypass', 'localhost', location='remedy')
-    sensu.proc()
+    config = configparser.ConfigParser()
+    parser = argparse.ArgumentParser(description='Meditation Self-healing Infrastructure')
+
+    parser.add_argument('-c', '--config', dest='config', type=str,
+                        help='Configuration File', required=True)
+    parser.add_argument('-p', '--pool-size', dest='pool', type=int,
+                        help='Number of workers', required=True)
+
+    parser.add_argument('-s', '--states', dest='location', type=str,
+                        help='Salt state remedies')
+
+    opts = parser.parse_args()
+
+    try:
+        config.read_file(open(opts.config, 'r'))
+    except IOError, e:
+        print 'Unable to open {0}: {1}'.format(opts.config, e.strerror)
+        sys.exit(1)
+
+    for i in range(opts.pool):
+        print 'Starting worker: {0}'.format(i)
+        if opts.location:
+            Process(target=worker, args=(config['redis']['server'], config['redis']['port'], opts.location)).start()
+        else:
+            Process(target=worker, args=(config['redis']['server'], config['redis']['port'])).start()
+
+    meditation = Process(target=server, args=(config['sensu']['server'], config['sensu']['username'], config['sensu']['password'])).start()
