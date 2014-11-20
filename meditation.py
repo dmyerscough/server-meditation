@@ -31,7 +31,9 @@ def server(hostname, username, password, interval=20):
         req = requests.get(hostname + '/events', auth=(username, password))
 
         if req.status_code != 200:
-            log.info('Sensu API responded with status {0}'.format(req.status_code))
+            log.info('Sensu API responded with status {0}'.format(
+                req.status_code)
+            )
 
         for event in req.json():
             server.send_json(event)
@@ -66,7 +68,8 @@ def worker(hostname, port=6379, location=None):
             event = worker.recv_json()
             log.info('Got Event')
 
-            eventId = '|-'.join([event['client']['name'], event['check']['name']])
+            eventId = '|-'.join([event['client']['name'],
+                                event['check']['name']])
 
             if not _jobs.get(eventId):
                 if location:
@@ -95,6 +98,9 @@ def worker(hostname, port=6379, location=None):
                 # We can remove our lock when Sensu has performed a check
                 _jobs.expire(eventId, (event['check']['interval'] * 2))
 
+                log.info('{0} event will expire from redis in {1} \
+                    seconds'.format(eventId, (event['check']['interval'] * 2)))
+
 
 if __name__ == '__main__':
 
@@ -120,8 +126,13 @@ if __name__ == '__main__':
     for i in range(opts.pool):
         print 'Starting worker: {0}'.format(i)
         if opts.location:
-            Process(target=worker, args=(config['redis']['server'], config['redis']['port'], opts.location)).start()
+            Process(target=worker, args=(config['redis']['server'],
+                                         config['redis']['port'],
+                                         opts.location)).start()
         else:
-            Process(target=worker, args=(config['redis']['server'], config['redis']['port'])).start()
+            Process(target=worker, args=(config['redis']['server'],
+                                         config['redis']['port'])).start()
 
-    meditation = Process(target=server, args=(config['sensu']['server'], config['sensu']['username'], config['sensu']['password'])).start()
+    meditation = Process(target=server, args=(config['sensu']['server'],
+                                              config['sensu']['username'],
+                                              config['sensu']['password'])).start()
