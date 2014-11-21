@@ -8,6 +8,7 @@ import redis
 import time
 import zmq
 import sys
+import os
 
 # Import logging before Salt otherwise Salt will overwirte our settings
 logging.basicConfig(level=logging.INFO,
@@ -43,11 +44,12 @@ def server(hostname, username, password, interval=20):
     return True
 
 
-def worker(hostname, port=6379, location=None):
+def worker(hostname, port, base, location):
     '''
     Pull events from the ZeroMQ server and run remediation against
     problematic events
     '''
+    log.info('Connecting to redis {0}:{1}'.format(hostname, port))
     _jobs = redis.StrictRedis(host=hostname, port=port)
 
     context = zmq.Context()
@@ -66,40 +68,40 @@ def worker(hostname, port=6379, location=None):
 
         if socks.get(worker) == zmq.POLLIN:
             event = worker.recv_json()
-            log.info('Got Event')
+            log.info('Got event: {0}'.format(event))
 
             eventId = '|-'.join([event['client']['name'],
-                                event['check']['name']])
+                                 event['check']['name']])
 
             if not _jobs.get(eventId):
-                if location:
-                    state = '/'.join([location, event['check']['name']])
+                state = os.path.join(base, location, event['check']['name'])
+
+                if os.path.isfile(state + '.sls'):
+                    log.info('Locking event into redis & executing Salt remediation')
+                    _jobs.set(eventId, True)
+
+                    res = client.cmd(event['client']['name'], 'state.sls', [os.path.join(location, event['check']['name'])])
+                    log.info('Salt response: {0}'.format(res))
+
+                    if isinstance(res[event['client']['name']], dict):
+                        log.info('{0} remediation was executed'.format(state))
+                        for i in res[event['client']['name']].items():
+                            action = i[-1]
+
+                            log.info('Salt response: {0}'.format(action))
+                            if action['result']:
+                                status['success'].update({action['name']:
+                                                          action['comment']})
+                            else:
+                                status['fail'].update({action['name']:
+                                                       action['comment']})
+
+                    # We can remove our lock when Sensu has performed a check
+                    _jobs.expire(eventId, (event['check']['interval'] * 2))
+
+                    log.info('{0} event will expire from redis in {1} seconds'.format(eventId, (event['check']['interval'] * 2)))
                 else:
-                    state = event['check']['name']
-
-                # Ensure the Salt command is not executed more than once
-                _jobs.set(eventId, True)
-                log.info('Locking event into Redis & Executing Salt Remedy')
-
-                res = client.cmd(event['client']['name'], 'state.sls', [state])
-
-                if isinstance(res[event['client']['name']], dict):
-                    log.info('{0} remedy was executed'.format(state))
-                    for i in res[event['client']['name']].items():
-                        action = i[-1]
-
-                        if action['result']:
-                            status['success'].update({action['name']:
-                                                      action['comment']})
-                        else:
-                            status['fail'].update({action['name']:
-                                                   action['comment']})
-
-                # We can remove our lock when Sensu has performed a check
-                _jobs.expire(eventId, (event['check']['interval'] * 2))
-
-                log.info('{0} event will expire from redis in {1} \
-                    seconds'.format(eventId, (event['check']['interval'] * 2)))
+                    log.info('{0}.sls remediation does not exist'.format(state))
 
 
 if __name__ == '__main__':
@@ -111,27 +113,37 @@ if __name__ == '__main__':
                         help='Configuration File', required=True)
     parser.add_argument('-p', '--pool-size', dest='pool', type=int,
                         help='Number of workers', required=True)
-
-    parser.add_argument('-s', '--states', dest='location', type=str,
-                        help='Salt state remedies')
+    parser.add_argument('-m', '--salt-master-config', dest='salt', type=str,
+                        default='/etc/salt/master',
+                        help='Salt master configuration')
+    parser.add_argument('-l', '--location', dest='location', type=str,
+                        default='', help='Salt state remedies')
 
     opts = parser.parse_args()
 
     try:
         config.read_file(open(opts.config, 'r'))
     except IOError, e:
-        print 'Unable to open {0}: {1}'.format(opts.config, e.strerror)
+        log.info('Unable to open {0}: {1}'.format(opts.salt, e.strerror))
         sys.exit(1)
 
+    try:
+        _salt_bases = salt.config.master_config(opts.salt)['file_roots']['base']
+    except IOError, e:
+        log.info('Unable to open {0}: {1}'.format(opts.salt, e.strerror))
+        sys.exit(1)
+
+    for i in _salt_bases:
+        if os.path.isdir(os.path.join(i, opts.location)):
+            salt_base = i
+            break
+    
     for i in range(opts.pool):
-        print 'Starting worker: {0}'.format(i)
-        if opts.location:
-            Process(target=worker, args=(config['redis']['server'],
-                                         config['redis']['port'],
-                                         opts.location)).start()
-        else:
-            Process(target=worker, args=(config['redis']['server'],
-                                         config['redis']['port'])).start()
+        log.info('Starting worker: {0}'.format(i))
+        Process(target=worker, args=(config['redis']['server'],
+                                     config['redis']['port'],
+                                     salt_base,
+                                     opts.location)).start()
 
     meditation = Process(target=server, args=(config['sensu']['server'],
                                               config['sensu']['username'],
