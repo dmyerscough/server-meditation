@@ -1,0 +1,5 @@
+pyzmq==14.3.1
+requests==1.1.0
+configparser==3.5.0b2
+argparse==1.2.2
+redis==2.10.3
