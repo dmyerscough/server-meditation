@@ -11,15 +11,14 @@ import sys
 import os
 
 # Import logging before Salt otherwise Salt will overwirte our settings
-logging.basicConfig(level=logging.INFO,
-                    format='[ %(asctime)-15s ] %(message)s')
+logging.basicConfig(level=logging.INFO, format='[ %(asctime)-15s ] %(message)s')
 log = logging.getLogger(__name__)
 
 import salt.client
 from multiprocessing import Process
 
 
-def server(hostname, username, password, interval=20):
+def server(hostname, username, password, interval=10):
     '''
     Query Sensu API for current monitoring events
     '''
@@ -113,6 +112,9 @@ if __name__ == '__main__':
                         help='Configuration File', required=True)
     parser.add_argument('-p', '--pool-size', dest='pool', type=int,
                         help='Number of workers', required=True)
+    parser.add_argument('-i', '--interval', dest='interval', type=int,
+                        default=10,
+                        help='How frequently to check Sensu events')
     parser.add_argument('-m', '--salt-master-config', dest='salt', type=str,
                         default='/etc/salt/master',
                         help='Salt master configuration')
@@ -128,14 +130,14 @@ if __name__ == '__main__':
         sys.exit(1)
 
     try:
-        _salt_bases = salt.config.master_config(opts.salt)['file_roots']['base']
+        file_roots = salt.config.master_config(opts.salt)['file_roots']['base']
     except IOError, e:
-        log.info('Unable to open {0}: {1}'.format(opts.salt, e.strerror))
+        log.info('Salt file_roots: {1}'.format(opts.salt, e.strerror))
         sys.exit(1)
 
-    for i in _salt_bases:
-        if os.path.isdir(os.path.join(i, opts.location)):
-            salt_base = i
+    for _base in file_roots:
+        if os.path.isdir(os.path.join(_base, opts.location)):
+            salt_base = _base
             break
     
     for i in range(opts.pool):
@@ -147,4 +149,5 @@ if __name__ == '__main__':
 
     meditation = Process(target=server, args=(config['sensu']['server'],
                                               config['sensu']['username'],
-                                              config['sensu']['password'])).start()
+                                              config['sensu']['password'],
+                                              opts.interval)).start()
