@@ -6,12 +6,14 @@ the system. If the issue cannot be resolved, an operator will be contacted.
 Starting meditation:-
 
 ```bash
-./meditation.py -c meditation.ini -s remedy -p 2
+./meditation.py -c meditation.ini -p 2 -i 10 -b /srv/salt -l remedy
 ```
 
 * `-c` specifies where the configuration file lives
 * `-s` specifies where the Salt states exist
 * `-p` specifies how many worker processes you would like to start
+* `-b` specifies the Salt base root
+* `-l` specifies the directory within the Salt base where remediation sls live
 
 NOTE 
 ====
